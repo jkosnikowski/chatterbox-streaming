@@ -158,7 +158,7 @@ Support this project on Ko-fi: https://ko-fi.com/davidbrowne17
 
 # Rook Fork — Changes & Fixes
 
-This fork ([jkosnikowski/chatterbox-streaming](https://github.com/jkosnikowski/chatterbox-streaming)) includes stability and performance fixes for long-running production use as a voice backend for the [Rook](https://github.com/jkosnikowski/rook) AI companion.
+This fork ([jkosnikowski/chatterbox-streaming](https://github.com/jkosnikowski/chatterbox-streaming)) includes stability and performance fixes for long-running production use as a real-time voice backend.
 
 ## CUDA Stability Fixes (`rook/cuda-safety-guards`)
 
