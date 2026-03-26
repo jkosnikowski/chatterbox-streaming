@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 
 from .models.t3 import T3
-from .models.s3tokenizer import S3_SR, drop_invalid_tokens
+from .models.s3tokenizer import S3_SR, SPEECH_VOCAB_SIZE, drop_invalid_tokens
 from .models.s3gen import S3GEN_SR, S3Gen
 from .models.tokenizers import EnTokenizer
 from .models.voice_encoder import VoiceEncoder
@@ -262,7 +262,7 @@ class ChatterboxTTS:
 
             # TODO: output becomes 1D
             speech_tokens = drop_invalid_tokens(speech_tokens)
-            speech_tokens = speech_tokens.to(self.device)
+            speech_tokens = speech_tokens[speech_tokens < SPEECH_VOCAB_SIZE].to(self.device)
 
             wav, _ = self.s3gen.inference(
                 speech_tokens=speech_tokens,
@@ -452,8 +452,10 @@ class ChatterboxTTS:
             tokens_to_process = new_tokens
             context_length = 0
 
-        # Drop any invalid tokens and move to the correct device
-        clean_tokens = drop_invalid_tokens(tokens_to_process).to(self.device)
+        # Drop SOS/EOS markers, then filter any out-of-range tokens that
+        # would cause a CUDA index-out-of-bounds in the s3gen vocoder.
+        clean_tokens = drop_invalid_tokens(tokens_to_process)
+        clean_tokens = clean_tokens[clean_tokens < SPEECH_VOCAB_SIZE].to(self.device)
         if len(clean_tokens) == 0:
             return None, 0.0, False
 
