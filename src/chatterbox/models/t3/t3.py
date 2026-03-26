@@ -246,30 +246,22 @@ class T3(nn.Module):
             speech_tokens=initial_speech_tokens,
         )
 
-        # In order to use the standard HF generate method, we need to extend some methods to inject our custom logic
-        # Note the llama-specific logic. Other tfmr types can be added later.
-
-        self.compiled = False
-
-        # TODO? synchronize the expensive compile function
-        # with self.compile_lock:
-        if not self.compiled:
-            alignment_stream_analyzer = AlignmentStreamAnalyzer(
-                self.tfmr,
-                None,
-                text_tokens_slice=(len_cond, len_cond + text_tokens.size(-1)),
-                alignment_layer_idx=9, # TODO: hparam or something?
-                eos_idx=self.hp.stop_speech_token,
-            )
-            patched_model = T3HuggingfaceBackend(
-                config=self.cfg,
-                llama=self.tfmr,
-                speech_enc=self.speech_emb,
-                speech_head=self.speech_head,
-                alignment_stream_analyzer=alignment_stream_analyzer,
-            )
-            self.patched_model = patched_model
-            self.compiled = True
+        # Build a lightweight backend that wraps the Llama model with our
+        # custom speech embedding and logit projection layers.
+        # NOTE: AlignmentStreamAnalyzer is intentionally NOT used here.
+        # It registers forward hooks that copy attention weights to CPU on
+        # every forward pass.  In inference() the analyzer's .step() is
+        # never called (it's commented out in T3HuggingfaceBackend.forward),
+        # so the hooks are pure overhead that accumulates across calls and
+        # eventually triggers a fatal CUDA device-side assert.
+        # The analyzer is only needed for inference_stream() where .step()
+        # is used for online hallucination detection.
+        patched_model = T3HuggingfaceBackend(
+            config=self.cfg,
+            llama=self.tfmr,
+            speech_enc=self.speech_emb,
+            speech_head=self.speech_head,
+        )
 
         # # Run normal generate method, which calls our custom extended methods
         # return self.patched_model.generate(
@@ -309,18 +301,19 @@ class T3(nn.Module):
         repetition_penalty_processor = RepetitionPenaltyLogitsProcessor(penalty=repetition_penalty)
 
         # ---- Initial Forward Pass (no kv_cache yet) ----
-        output = self.patched_model(
+        output = patched_model(
             inputs_embeds=inputs_embeds,
             past_key_values=None,
             use_cache=True,
-            output_attentions=True,
+            output_attentions=False,
             output_hidden_states=True,
             return_dict=True,
         )
-        # Initialize kv_cache with the full context.
         past = output.past_key_values
 
         # ---- Generation Loop using kv_cache ----
+        max_token_id = self.hp.speech_tokens_dict_size - 1
+
         for i in tqdm(range(max_new_tokens), desc="Sampling", dynamic_ncols=True):
             logits = output.logits[:, -1, :]
 
@@ -330,43 +323,46 @@ class T3(nn.Module):
             logits = logits_cond + cfg_weight * (logits_cond - logits_uncond)
             logits = logits.squeeze(1)
 
-            # Apply temperature scaling.
+            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                logger.warning(f"NaN/Inf in logits at step {i}, stopping generation early")
+                break
+
             if temperature != 1.0:
                 logits = logits / temperature
 
-            # Apply repetition penalty and top‑p filtering.
             logits = repetition_penalty_processor(generated_ids, logits)
             logits = top_p_warper(None, logits)
 
-            # Convert logits to probabilities and sample the next token.
             probs = torch.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)  # shape: (B, 1)
+
+            if torch.isnan(probs).any():
+                logger.warning(f"NaN in probs at step {i}, stopping generation early")
+                break
+
+            next_token = torch.multinomial(probs, num_samples=1)
+            next_token = torch.clamp(next_token, 0, max_token_id)
 
             predicted.append(next_token)
             generated_ids = torch.cat([generated_ids, next_token], dim=1)
 
-            # Check for EOS token.
             if next_token.view(-1) == self.hp.stop_speech_token:
                 break
 
-            # Get embedding for the new token.
             next_token_embed = self.speech_emb(next_token)
             next_token_embed = next_token_embed + self.speech_pos_emb.get_fixed_embedding(i + 1)
-
-            #  For CFG
             next_token_embed = torch.cat([next_token_embed, next_token_embed])
 
-            # Forward pass with only the new token and the cached past.
-            output = self.patched_model(
+            output = patched_model(
                 inputs_embeds=next_token_embed,
                 past_key_values=past,
-                output_attentions=True,
+                output_attentions=False,
                 output_hidden_states=True,
                 return_dict=True,
             )
-            # Update the kv_cache.
             past = output.past_key_values
 
         # Concatenate all predicted tokens along the sequence dimension.
+        if not predicted:
+            return torch.tensor([[self.hp.stop_speech_token]], dtype=torch.long, device=device)
         predicted_tokens = torch.cat(predicted, dim=1)  # shape: (B, num_tokens)
         return predicted_tokens

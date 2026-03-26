@@ -71,20 +71,32 @@ class AlignmentStreamAnalyzer:
             - When `output_attentions=True`, `LlamaSdpaAttention.forward` calls `LlamaAttention.forward`.
             - `attn_output` has shape [B, H, T0, T0] for the 0th entry, and [B, H, 1, T0+i] for the rest i-th.
             """
+            if output[1] is None:
+                return
             step_attention = output[1].cpu() # (B, 16, N, N)
             self.last_aligned_attn = step_attention[0].mean(0) # (N, N)
 
         target_layer = tfmr.layers[alignment_layer_idx].self_attn
-        hook_handle = target_layer.register_forward_hook(attention_forward_hook)
+        self._hook_handle = target_layer.register_forward_hook(attention_forward_hook)
 
-        # Backup original forward
         original_forward = target_layer.forward
         def patched_forward(self, *args, **kwargs):
             kwargs['output_attentions'] = True
             return original_forward(*args, **kwargs)
 
-        # TODO: how to unpatch it?
+        self._target_layer = target_layer
+        self._original_forward = original_forward
         target_layer.forward = MethodType(patched_forward, target_layer)
+
+    def remove(self):
+        """Remove the hook and restore the original forward method."""
+        if self._hook_handle is not None:
+            self._hook_handle.remove()
+            self._hook_handle = None
+        if self._target_layer is not None and self._original_forward is not None:
+            self._target_layer.forward = self._original_forward
+            self._target_layer = None
+            self._original_forward = None
 
     def step(self, logits):
         """

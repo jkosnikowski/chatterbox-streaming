@@ -302,27 +302,30 @@ class ChatterboxTTS:
             speech_tokens=initial_speech_tokens,
         )
 
-        # Setup model if not compiled
-        if not self.t3.compiled:
-            from .models.t3.inference.alignment_stream_analyzer import AlignmentStreamAnalyzer
-            from .models.t3.inference.t3_hf_backend import T3HuggingfaceBackend
-            
-            alignment_stream_analyzer = AlignmentStreamAnalyzer(
-                self.t3.tfmr,
-                None,
-                text_tokens_slice=(len_cond, len_cond + text_tokens.size(-1)),
-                alignment_layer_idx=9,
-                eos_idx=self.t3.hp.stop_speech_token,
-            )
-            patched_model = T3HuggingfaceBackend(
-                config=self.t3.cfg,
-                llama=self.t3.tfmr,
-                speech_enc=self.t3.speech_emb,
-                speech_head=self.t3.speech_head,
-                alignment_stream_analyzer=alignment_stream_analyzer,
-            )
-            self.t3.patched_model = patched_model
-            self.t3.compiled = True
+        # The AlignmentStreamAnalyzer registers a forward hook + patches
+        # the forward method on layer 9.  We must clean up any previous
+        # analyzer before creating a new one, otherwise hooks accumulate
+        # across calls and eventually corrupt the CUDA context.
+        from .models.t3.inference.alignment_stream_analyzer import AlignmentStreamAnalyzer
+        from .models.t3.inference.t3_hf_backend import T3HuggingfaceBackend
+
+        if hasattr(self, '_stream_analyzer') and self._stream_analyzer is not None:
+            self._stream_analyzer.remove()
+
+        self._stream_analyzer = AlignmentStreamAnalyzer(
+            self.t3.tfmr,
+            None,
+            text_tokens_slice=(len_cond, len_cond + text_tokens.size(-1)),
+            alignment_layer_idx=9,
+            eos_idx=self.t3.hp.stop_speech_token,
+        )
+        patched_model = T3HuggingfaceBackend(
+            config=self.t3.cfg,
+            llama=self.t3.tfmr,
+            speech_enc=self.t3.speech_emb,
+            speech_head=self.t3.speech_head,
+            alignment_stream_analyzer=self._stream_analyzer,
+        )
 
         device = embeds.device
 
@@ -346,7 +349,7 @@ class ChatterboxTTS:
         repetition_penalty_processor = RepetitionPenaltyLogitsProcessor(penalty=2.0)
 
         # Initial forward pass
-        output = self.t3.patched_model(
+        output = patched_model(
             inputs_embeds=inputs_embeds,
             past_key_values=None,
             use_cache=True,
@@ -357,6 +360,8 @@ class ChatterboxTTS:
         past = output.past_key_values
 
         # Generation loop
+        max_token_id = self.t3.hp.speech_tokens_dict_size - 1
+
         for i in range(max_new_tokens):
             logits = output.logits[:, -1, :]
 
@@ -366,17 +371,29 @@ class ChatterboxTTS:
             logits = logits_cond + cfg_weight * (logits_cond - logits_uncond)
             logits = logits.squeeze(1)
 
+            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                if chunk_buffer:
+                    yield torch.cat(chunk_buffer, dim=1)
+                break
+
             # Apply temperature scaling
             if temperature != 1.0:
                 logits = logits / temperature
 
-            # Apply repetition penalty and top‑p filtering
+            # Apply repetition penalty and top-p filtering
             logits = repetition_penalty_processor(generated_ids, logits)
             logits = top_p_warper(None, logits)
 
             # Convert logits to probabilities and sample
             probs = torch.softmax(logits, dim=-1)
+
+            if torch.isnan(probs).any():
+                if chunk_buffer:
+                    yield torch.cat(chunk_buffer, dim=1)
+                break
+
             next_token = torch.multinomial(probs, num_samples=1)
+            next_token = torch.clamp(next_token, 0, max_token_id)
 
             predicted.append(next_token)
             chunk_buffer.append(next_token)
@@ -402,7 +419,7 @@ class ChatterboxTTS:
             next_token_embed = torch.cat([next_token_embed, next_token_embed])
 
             # Forward pass with cached past
-            output = self.t3.patched_model(
+            output = patched_model(
                 inputs_embeds=next_token_embed,
                 past_key_values=past,
                 output_attentions=True,
