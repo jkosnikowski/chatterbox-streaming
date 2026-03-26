@@ -153,3 +153,50 @@ David Browne
 
 ## Support me
 Support this project on Ko-fi: https://ko-fi.com/davidbrowne17
+
+---
+
+# Rook Fork — Changes & Fixes
+
+This fork ([jkosnikowski/chatterbox-streaming](https://github.com/jkosnikowski/chatterbox-streaming)) includes stability and performance fixes for long-running production use as a voice backend for the [Rook](https://github.com/jkosnikowski/rook) AI companion.
+
+## CUDA Stability Fixes (`rook/cuda-safety-guards`)
+
+The upstream streaming implementation can trigger fatal `CUDA device-side assert` errors during extended use, requiring a full process restart. These fixes eliminate the crash:
+
+### 1. AlignmentStreamAnalyzer hook cleanup
+**File:** `src/chatterbox/models/t3/inference/alignment_stream_analyzer.py`
+- Added `remove()` method to properly detach forward hooks and restore the original forward method
+- The upstream code had a `# TODO: how to unpatch it?` — this answers it
+- Without cleanup, hooks accumulate across calls, eventually corrupting attention weight copies and triggering the CUDA assert
+
+### 2. Analyzer removed from non-streaming `inference()` path
+**File:** `src/chatterbox/models/t3/t3.py`
+- The `AlignmentStreamAnalyzer` was being attached in `inference()` even though its `.step()` was never called there (commented out in `T3HuggingfaceBackend.forward`)
+- The hooks were pure overhead that accumulated and eventually caused the crash
+- Analyzer is now only used in `inference_stream()` where it's actually needed
+
+### 3. NaN/Inf detection and token clamping
+**Files:** `src/chatterbox/models/t3/t3.py`, `src/chatterbox/tts.py`
+- Added NaN/Inf checks on logits and probabilities — stops generation early if corruption is detected rather than feeding garbage to `torch.multinomial`
+- Added `torch.clamp(next_token, 0, max_token_id)` after sampling to prevent index-out-of-bounds on the embedding lookup
+- Handles the edge case where corrupted logits produce an invalid token ID
+
+### 4. Null attention guard in hook
+**File:** `src/chatterbox/models/t3/inference/alignment_stream_analyzer.py`
+- Added `if output[1] is None: return` guard in the attention forward hook
+- Prevents crash when attention weights are None (can happen with certain attention implementations)
+
+## Performance Optimization
+
+### 5. Disabled `output_hidden_states` (rsxdalv optimization)
+**Files:** `src/chatterbox/models/t3/inference/t3_hf_backend.py`, `src/chatterbox/models/t3/t3.py`, `src/chatterbox/tts.py`
+- Changed from `output_hidden_states=True` + `hidden_states[-1]` to `output_hidden_states=False` + `last_hidden_state`
+- The model stores intermediate hidden states for all 30 Llama layers when `output_hidden_states=True`, but only the last layer's output is ever used
+- Reduces memory usage and can enable better kernel paths in PyTorch
+- Credit: [rsxdalv's analysis](https://github.com/resemble-ai/chatterbox/issues/127) identified this as a meaningful optimization
+
+### 6. Disabled `output_attentions` in non-streaming path
+**File:** `src/chatterbox/models/t3/t3.py`
+- Set `output_attentions=False` in `inference()` since the alignment analyzer is not used there
+- Allows SDPA (Scaled Dot Product Attention) to use optimized kernels instead of falling back to eager attention
